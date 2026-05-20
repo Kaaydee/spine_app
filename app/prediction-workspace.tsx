@@ -120,10 +120,12 @@ function normalizeDetection(raw: Record<string, unknown>, index: number): Detect
 }
 
 function toSavedDetection(detection: Detection) {
+  const label = normalizedDetectionLabel(detection.label);
+
   return {
     ...detection.original,
-    disease: detection.label,
-    label: detection.label,
+    disease: label,
+    label,
     confidence: detection.confidence,
     bbox: {
       xmin: Math.round(detection.x * 100) / 100,
@@ -134,8 +136,12 @@ function toSavedDetection(detection: Detection) {
   };
 }
 
+function normalizedDetectionLabel(label: string) {
+  return label.trim() || "finding";
+}
+
 function detectionColor(label: string) {
-  return diseaseColors[label] ?? fallbackColor;
+  return diseaseColors[normalizedDetectionLabel(label)] ?? fallbackColor;
 }
 
 function confidenceText(confidence?: number) {
@@ -143,7 +149,35 @@ function confidenceText(confidence?: number) {
 }
 
 function detectionCaption(detection: Detection) {
-  return `${detection.label} ${confidenceText(detection.confidence)}`;
+  return `${normalizedDetectionLabel(detection.label)} ${confidenceText(detection.confidence)}`;
+}
+
+function formatSavedTime(value?: string) {
+  if (!value) return "No update time";
+
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "No update time";
+
+  return new Intl.DateTimeFormat("en-GB", {
+    dateStyle: "short",
+    timeStyle: "medium",
+    timeZone: "Asia/Ho_Chi_Minh",
+  }).format(date);
+}
+
+function updateOriginalDetectionLabel(original: Record<string, unknown>, label: string) {
+  return {
+    ...original,
+    disease: label,
+    label,
+  };
+}
+
+function cloneDetections(detections: Detection[]) {
+  return detections.map((detection) => ({
+    ...detection,
+    original: { ...detection.original },
+  }));
 }
 
 function loadImageFromUrl(url: string) {
@@ -178,19 +212,36 @@ export default function PredictionWorkspace() {
   const [isSaving, setIsSaving] = useState(false);
   const [savedPredictions, setSavedPredictions] = useState<SavedPredictionSummary[]>([]);
   const [isLoadingSaved, setIsLoadingSaved] = useState(false);
+  const [undoStack, setUndoStack] = useState<Detection[][]>([]);
   const stageWrapRef = useRef<HTMLDivElement>(null);
   const transformerRef = useRef<Konva.Transformer>(null);
   const rectRefs = useRef<Record<string, Konva.Rect | null>>({});
-  const [stageWidth, setStageWidth] = useState(760);
+  const [stageWidth, setStageWidth] = useState(640);
+  const [isMounted, setIsMounted] = useState(false);
 
   useEffect(() => {
+    const timer = window.setTimeout(() => setIsMounted(true), 0);
+    return () => window.clearTimeout(timer);
+  }, []);
+
+  useEffect(() => {
+    if (!isMounted) return;
+
     const updateWidth = () => {
-      setStageWidth(stageWrapRef.current?.clientWidth ?? 760);
+      const width = stageWrapRef.current?.clientWidth ?? 640;
+      setStageWidth(Math.max(width - 24, 280));
     };
     updateWidth();
+
+    const observer = new ResizeObserver(updateWidth);
+    if (stageWrapRef.current) observer.observe(stageWrapRef.current);
+
     window.addEventListener("resize", updateWidth);
-    return () => window.removeEventListener("resize", updateWidth);
-  }, []);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", updateWidth);
+    };
+  }, [isMounted]);
 
   useEffect(() => {
     if (!file) return;
@@ -273,6 +324,34 @@ export default function PredictionWorkspace() {
     };
   }, [image, stageWidth]);
 
+  const selectedDetection = useMemo(
+    () => detections.find((detection) => detection.id === selectedId),
+    [detections, selectedId]
+  );
+
+  const updateDetectionsWithUndo = (updater: (current: Detection[]) => Detection[]) => {
+    setDetections((current) => {
+      const next = updater(current);
+      if (next === current) return current;
+      setUndoStack((stack) => [...stack.slice(-19), cloneDetections(current)]);
+      return next;
+    });
+  };
+
+  const handleUndo = () => {
+    setUndoStack((stack) => {
+      const previous = stack.at(-1);
+      if (!previous) return stack;
+
+      setDetections(cloneDetections(previous));
+      setSelectedId((current) =>
+        previous.some((detection) => detection.id === current) ? current : previous.at(-1)?.id ?? ""
+      );
+      return stack.slice(0, -1);
+    });
+    setHoveredId("");
+  };
+
   const handleLogin = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     setAuthError("");
@@ -324,6 +403,7 @@ export default function PredictionWorkspace() {
     setDetections([]);
     setSelectedId("");
     setHoveredId("");
+    setUndoStack([]);
 
     const formData = new FormData();
     formData.append("file", file);
@@ -349,12 +429,13 @@ export default function PredictionWorkspace() {
     setDetections(rawDetections.map(normalizeDetection));
     setSelectedId("");
     setHoveredId("");
+    setUndoStack([]);
     setMessage(`Prediction complete: ${rawDetections.length} boxes.`);
     loadSavedPredictions();
   };
 
   const handleDrag = (id: string, node: Konva.Rect) => {
-    setDetections((current) =>
+    updateDetectionsWithUndo((current) =>
       current.map((detection) =>
         detection.id === id
           ? {
@@ -373,7 +454,7 @@ export default function PredictionWorkspace() {
     node.scaleX(1);
     node.scaleY(1);
 
-    setDetections((current) =>
+    updateDetectionsWithUndo((current) =>
       current.map((detection) =>
         detection.id === id
           ? {
@@ -386,6 +467,65 @@ export default function PredictionWorkspace() {
           : detection
       )
     );
+  };
+
+  const handleLabelChange = (id: string, label: string) => {
+    updateDetectionsWithUndo((current) =>
+      current.map((detection) =>
+        detection.id === id
+          ? {
+              ...detection,
+              label,
+              original: updateOriginalDetectionLabel(detection.original, label),
+            }
+          : detection
+      )
+    );
+  };
+
+  const handleAddDetection = () => {
+    if (!image || !predictionId) {
+      setMessage("Run prediction or load a saved result before adding a box.");
+      return;
+    }
+
+    const id = `manual-${Date.now()}`;
+    const label = "finding";
+    const width = Math.min(Math.max(Math.round(image.naturalWidth * 0.22), 40), image.naturalWidth);
+    const height = Math.min(Math.max(Math.round(image.naturalHeight * 0.18), 40), image.naturalHeight);
+    const x = Math.max(Math.round((image.naturalWidth - width) / 2), 0);
+    const y = Math.max(Math.round((image.naturalHeight - height) / 2), 0);
+
+    const detection: Detection = {
+      id,
+      label,
+      x,
+      y,
+      width,
+      height,
+      original: {
+        id,
+        disease: label,
+        label,
+        source: "manual",
+      },
+    };
+
+    updateDetectionsWithUndo((current) => [...current, detection]);
+    setSelectedId(id);
+    setHoveredId("");
+    setMessage("");
+  };
+
+  const handleDeleteDetection = (id: string) => {
+    const detection = detections.find((item) => item.id === id);
+    if (!detection) return;
+    if (!window.confirm(`Are you sure you want to delete "${normalizedDetectionLabel(detection.label)}"?`)) return;
+
+    updateDetectionsWithUndo((current) => current.filter((item) => item.id !== id));
+    rectRefs.current[id] = null;
+    setSelectedId((current) => (current === id ? "" : current));
+    setHoveredId((current) => (current === id ? "" : current));
   };
 
   const handleSave = async () => {
@@ -425,6 +565,7 @@ export default function PredictionWorkspace() {
     setMessage("");
     setSelectedId("");
     setHoveredId("");
+    setUndoStack([]);
 
     const response = await fetch(`/api/predictions/${id}`);
     const result = (await response.json()) as {
@@ -444,6 +585,7 @@ export default function PredictionWorkspace() {
     setModel(saved.model === "without_medclip" ? "without_medclip" : "with_medclip");
     setThreshold(saved.threshold);
     setDetections(saved.detections.map(normalizeDetection));
+    setUndoStack([]);
 
     if (!saved.imageDataUrl) {
       setImage(null);
@@ -460,23 +602,50 @@ export default function PredictionWorkspace() {
     }
   };
 
-  if (status === "loading") {
+  const handleDeleteSavedPrediction = async (saved: SavedPredictionSummary) => {
+    if (!window.confirm(`Are you sure you want to delete "${saved.originalFileName}"?`)) return;
+
+    const response = await fetch(`/api/predictions/${saved.id}`, {
+      method: "DELETE",
+    });
+    const result = (await response.json()) as { message?: string };
+
+    if (!response.ok) {
+      setMessage(result.message ?? "Could not delete saved result.");
+      return;
+    }
+
+    setSavedPredictions((current) => current.filter((item) => item.id !== saved.id));
+    if (predictionId === saved.id) {
+      setPredictionId("");
+      setDetections([]);
+      setSelectedId("");
+      setHoveredId("");
+      setUndoStack([]);
+      setImage(null);
+      setImageDataUrl("");
+      setFile(null);
+    }
+    setMessage("Saved result deleted.");
+  };
+
+  if (!isMounted || status === "loading") {
     return <main className="grid min-h-screen place-items-center bg-slate-50">Loading...</main>;
   }
 
   return (
     <main className="min-h-screen bg-slate-50 text-slate-950">
       <div className="mx-auto flex w-full max-w-7xl flex-col gap-5 px-5 py-5">
-        <header className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 pb-4">
+        <header className="sticky top-3 z-20 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-cyan-500 bg-cyan-700 px-5 py-4 shadow-lg shadow-cyan-900/25">
           <div>
-            <h1 className="text-2xl font-semibold tracking-normal">Spine X-ray Annotation</h1>
-            <p className="text-sm text-slate-500">Predict, review, adjust, and save bounding boxes.</p>
+            <h1 className="text-2xl font-bold tracking-normal text-white">Spine X-ray Annotation</h1>
+            <p className="text-sm text-cyan-50">Predict, review, adjust, and save bounding boxes.</p>
           </div>
           {session?.user?.email ? (
             <div className="flex items-center gap-3">
-              <span className="text-sm text-slate-600">{session.user.email}</span>
+              <span className="text-sm font-medium text-cyan-50">{session.user.email}</span>
               <button
-                className="h-9 rounded-md border border-slate-300 px-3 text-sm font-medium hover:bg-white"
+                className="h-9 rounded-md border border-white/60 bg-white px-3 text-sm font-semibold text-cyan-800 hover:bg-cyan-50"
                 onClick={() => signOut()}
               >
                 Logout
@@ -573,6 +742,7 @@ export default function PredictionWorkspace() {
                     setDetections([]);
                     setSelectedId("");
                     setHoveredId("");
+                    setUndoStack([]);
                     setMessage("");
                   }}
                 />
@@ -654,135 +824,211 @@ export default function PredictionWorkspace() {
                     <p className="rounded-md bg-slate-100 px-3 py-2 text-sm text-slate-500">No saved results yet.</p>
                   ) : null}
                   {savedPredictions.map((saved) => (
-                    <button
+                    <div
                       key={saved.id}
-                      className={`rounded-md border px-3 py-2 text-left text-sm hover:bg-slate-50 ${
+                      className={`flex items-start gap-2 rounded-md border px-3 py-2 text-sm hover:bg-slate-50 ${
                         predictionId === saved.id ? "border-teal-600 bg-teal-50" : "border-slate-200"
                       }`}
-                      onClick={() => handleLoadSavedPrediction(saved.id)}
-                      type="button"
                     >
-                      <span className="block truncate font-semibold">{saved.originalFileName}</span>
-                      <span className="block text-slate-500">
-                        {saved.detectionCount} boxes · {modelLabels[saved.model as ModelChoice] ?? saved.model}
-                      </span>
-                      <span className="block text-xs text-slate-400">
-                        {saved.updatedAt ? new Date(saved.updatedAt).toLocaleString() : "No update time"}
-                      </span>
-                    </button>
+                      <button
+                        className="min-w-0 flex-1 text-left"
+                        onClick={() => handleLoadSavedPrediction(saved.id)}
+                        type="button"
+                      >
+                        <span className="block truncate font-semibold">{saved.originalFileName}</span>
+                        <span className="block text-slate-500">
+                          {saved.detectionCount} boxes · {modelLabels[saved.model as ModelChoice] ?? saved.model}
+                        </span>
+                        <span className="block text-xs text-slate-400">{formatSavedTime(saved.updatedAt)}</span>
+                      </button>
+                      <button
+                        aria-label="Delete saved result"
+                        className="grid h-7 w-7 shrink-0 place-items-center rounded-md border border-red-200 text-sm font-bold text-red-700 hover:bg-red-50"
+                        onClick={() => handleDeleteSavedPrediction(saved)}
+                        type="button"
+                      >
+                        X
+                      </button>
+                    </div>
                   ))}
                 </div>
               </section>
             </aside>
 
             <section className="min-h-[560px] rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
-              <div className="mb-3 flex items-center justify-between gap-3">
+              <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
                 <h2 className="text-lg font-semibold">Image and bounding boxes</h2>
                 <span className="text-sm text-slate-500">{detections.length} boxes</span>
               </div>
-              <div ref={stageWrapRef} className="overflow-auto rounded-md border border-slate-200 bg-slate-100 p-3">
-                <Stage
-                  width={stageSize.width}
-                  height={stageSize.height}
-                  onMouseDown={(event) => {
-                    if (event.target === event.target.getStage()) setSelectedId("");
-                  }}
-                  onMouseLeave={() => setHoveredId("")}
-                >
-                  <Layer>
-                    {image ? (
-                      <KonvaImage image={image} width={stageSize.width} height={stageSize.height} />
-                    ) : (
-                      <Text
-                        align="center"
-                        fill="#64748b"
-                        fontSize={16}
-                        text="Upload an X-ray image to begin"
-                        verticalAlign="middle"
-                        width={stageSize.width}
-                        height={stageSize.height}
-                      />
-                    )}
+              <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_320px]">
+                <div ref={stageWrapRef} className="overflow-auto rounded-md border border-slate-200 bg-slate-100 p-3">
+                  <div className="relative w-fit">
+                    <Stage
+                      width={stageSize.width}
+                      height={stageSize.height}
+                      onMouseDown={(event) => {
+                        if (event.target === event.target.getStage()) setSelectedId("");
+                      }}
+                      onMouseLeave={() => setHoveredId("")}
+                    >
+                      <Layer>
+                        {image ? (
+                          <KonvaImage image={image} width={stageSize.width} height={stageSize.height} />
+                        ) : null}
+                        {detections.map((detection) => (
+                          <Group
+                            key={detection.id}
+                            onMouseEnter={() => setHoveredId(detection.id)}
+                            onMouseLeave={() => setHoveredId("")}
+                          >
+                            {selectedId === detection.id || hoveredId === detection.id ? (
+                              <Label
+                                x={detection.x * stageSize.scale}
+                                y={Math.max(detection.y * stageSize.scale - 24, 0)}
+                              >
+                                <Tag fill={detectionColor(detection.label)} lineJoin="round" opacity={0.94} />
+                                <Text
+                                  fill="white"
+                                  fontSize={13}
+                                  fontStyle="bold"
+                                  padding={5}
+                                  text={detectionCaption(detection)}
+                                />
+                              </Label>
+                            ) : null}
+                            <Rect
+                              ref={(node) => {
+                                rectRefs.current[detection.id] = node;
+                              }}
+                              draggable
+                              height={detection.height * stageSize.scale}
+                              opacity={selectedId === detection.id || hoveredId === detection.id ? 0.9 : 0.72}
+                              stroke={selectedId === detection.id ? "#f97316" : detectionColor(detection.label)}
+                              strokeWidth={selectedId === detection.id ? 4 : hoveredId === detection.id ? 3.5 : 3}
+                              width={detection.width * stageSize.scale}
+                              x={detection.x * stageSize.scale}
+                              y={detection.y * stageSize.scale}
+                              onClick={() => setSelectedId(detection.id)}
+                              onTap={() => setSelectedId(detection.id)}
+                              onDragEnd={(event) => handleDrag(detection.id, event.target as Konva.Rect)}
+                              onTransformEnd={(event) => handleTransform(detection.id, event.target as Konva.Rect)}
+                            />
+                          </Group>
+                        ))}
+                        <Transformer
+                          ref={transformerRef}
+                          boundBoxFunc={(oldBox, newBox) =>
+                            newBox.width < 8 || newBox.height < 8 ? oldBox : newBox
+                          }
+                          rotateEnabled={false}
+                        />
+                      </Layer>
+                    </Stage>
+
+                    {!image ? (
+                      <div className="pointer-events-none absolute inset-0 grid place-items-center px-4 text-center text-base font-medium text-slate-500">
+                        Upload an X-ray image to begin
+                      </div>
+                    ) : null}
+
+                    {selectedDetection ? (
+                      <div
+                        className="absolute z-10 flex items-center gap-2 rounded-md border border-slate-300 bg-white/95 p-1 shadow-sm"
+                        style={{
+                          left: Math.min(
+                            Math.max(selectedDetection.x * stageSize.scale, 4),
+                            Math.max(stageSize.width - 260, 4)
+                          ),
+                          top: Math.max(selectedDetection.y * stageSize.scale - 44, 4),
+                          width: Math.min(Math.max(selectedDetection.width * stageSize.scale, 180), 260),
+                        }}
+                        onMouseDown={(event) => event.stopPropagation()}
+                      >
+                        <input
+                          aria-label="Selected object name"
+                          className="min-w-0 flex-1 rounded border border-transparent px-2 py-1 text-sm font-semibold outline-none focus:border-teal-600"
+                          value={selectedDetection.label}
+                          onChange={(event) => handleLabelChange(selectedDetection.id, event.target.value)}
+                        />
+                        <button
+                          aria-label="Delete selected bbox"
+                          className="grid h-7 w-7 shrink-0 place-items-center rounded-md border border-red-200 text-sm font-bold text-red-700 hover:bg-red-50"
+                          onClick={() => handleDeleteDetection(selectedDetection.id)}
+                          type="button"
+                        >
+                          X
+                        </button>
+                      </div>
+                    ) : null}
+                  </div>
+                </div>
+
+                <aside className="max-h-[680px] overflow-auto rounded-md border border-slate-200 bg-slate-50 p-3 xl:sticky xl:top-4">
+                  <div className="mb-3 flex items-center justify-between gap-2">
+                    <h3 className="text-sm font-semibold uppercase text-slate-500">Bbox labels</h3>
+                    <div className="flex items-center gap-2">
+                      <button
+                        className="h-8 rounded-md border border-slate-300 px-3 text-sm font-semibold text-slate-700 hover:bg-white disabled:cursor-not-allowed disabled:text-slate-400"
+                        disabled={undoStack.length === 0}
+                        onClick={handleUndo}
+                        type="button"
+                      >
+                        Undo
+                      </button>
+                      <button
+                        className="h-8 rounded-md border border-teal-700 px-3 text-sm font-semibold text-teal-800 hover:bg-teal-50 disabled:cursor-not-allowed disabled:border-slate-300 disabled:text-slate-400"
+                        disabled={!image || !predictionId}
+                        onClick={handleAddDetection}
+                        type="button"
+                      >
+                        Add
+                      </button>
+                    </div>
+                  </div>
+                  <div className="flex flex-col gap-2">
                     {detections.map((detection) => (
-                      <Group
+                      <div
                         key={detection.id}
+                        className={`rounded-md border bg-white px-3 py-3 text-sm ${
+                          selectedId === detection.id
+                            ? "border-orange-400 bg-orange-50"
+                            : "border-slate-200 hover:bg-slate-50"
+                        }`}
+                        onClick={() => setSelectedId(detection.id)}
                         onMouseEnter={() => setHoveredId(detection.id)}
                         onMouseLeave={() => setHoveredId("")}
                       >
-                        {selectedId === detection.id || hoveredId === detection.id ? (
-                          <Label
-                            x={detection.x * stageSize.scale}
-                            y={Math.max(detection.y * stageSize.scale - 24, 0)}
+                        <div className="flex items-start gap-2">
+                          <span
+                            className="mt-2 h-3 w-3 shrink-0 rounded-sm"
+                            style={{ backgroundColor: detectionColor(detection.label) }}
+                          />
+                          <input
+                            aria-label="Object name"
+                            className="min-w-0 flex-1 rounded-md border border-transparent bg-transparent px-1 py-1 text-sm font-semibold outline-none focus:border-teal-600 focus:bg-white"
+                            value={detection.label}
+                            onChange={(event) => handleLabelChange(detection.id, event.target.value)}
+                            onFocus={() => setSelectedId(detection.id)}
+                          />
+                          <button
+                            aria-label="Delete bbox"
+                            className="grid h-8 w-8 shrink-0 place-items-center rounded-md border border-red-200 text-sm font-bold text-red-700 hover:bg-red-50"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              handleDeleteDetection(detection.id);
+                            }}
+                            type="button"
                           >
-                            <Tag
-                              fill={detectionColor(detection.label)}
-                              lineJoin="round"
-                              opacity={0.94}
-                            />
-                            <Text
-                              fill="white"
-                              fontSize={13}
-                              fontStyle="bold"
-                              padding={5}
-                              text={detectionCaption(detection)}
-                            />
-                          </Label>
-                        ) : null}
-                        <Rect
-                          ref={(node) => {
-                            rectRefs.current[detection.id] = node;
-                          }}
-                          draggable
-                          height={detection.height * stageSize.scale}
-                          opacity={selectedId === detection.id || hoveredId === detection.id ? 0.9 : 0.72}
-                          stroke={selectedId === detection.id ? "#f97316" : detectionColor(detection.label)}
-                          strokeWidth={selectedId === detection.id ? 4 : hoveredId === detection.id ? 3.5 : 3}
-                          width={detection.width * stageSize.scale}
-                          x={detection.x * stageSize.scale}
-                          y={detection.y * stageSize.scale}
-                          onClick={() => setSelectedId(detection.id)}
-                          onTap={() => setSelectedId(detection.id)}
-                          onDragEnd={(event) => handleDrag(detection.id, event.target as Konva.Rect)}
-                          onTransformEnd={(event) => handleTransform(detection.id, event.target as Konva.Rect)}
-                        />
-                      </Group>
+                            X
+                          </button>
+                        </div>
+                        <div className="mt-2 pl-5 text-slate-500">
+                          confidence {confidenceText(detection.confidence)}
+                        </div>
+                      </div>
                     ))}
-                    <Transformer
-                      ref={transformerRef}
-                      boundBoxFunc={(oldBox, newBox) =>
-                        newBox.width < 8 || newBox.height < 8 ? oldBox : newBox
-                      }
-                      rotateEnabled={false}
-                    />
-                  </Layer>
-                </Stage>
-              </div>
-              <div className="mt-4 grid gap-2 md:grid-cols-2 xl:grid-cols-3">
-                {detections.map((detection) => (
-                  <button
-                    key={detection.id}
-                    className={`rounded-md border px-3 py-2 text-left text-sm ${
-                      selectedId === detection.id
-                        ? "border-orange-400 bg-orange-50"
-                        : "border-slate-200 hover:bg-slate-50"
-                    }`}
-                    onClick={() => setSelectedId(detection.id)}
-                    onMouseEnter={() => setHoveredId(detection.id)}
-                    onMouseLeave={() => setHoveredId("")}
-                    type="button"
-                  >
-                    <span className="flex items-center gap-2 font-semibold">
-                      <span
-                        className="h-3 w-3 rounded-sm"
-                        style={{ backgroundColor: detectionColor(detection.label) }}
-                      />
-                      {detection.label}
-                    </span>
-                    <span className="text-slate-500">
-                      confidence {confidenceText(detection.confidence)}
-                    </span>
-                  </button>
-                ))}
+                  </div>
+                </aside>
               </div>
             </section>
           </div>

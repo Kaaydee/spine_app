@@ -54,3 +54,33 @@ export async function GET(
     },
   });
 }
+
+export async function DELETE(
+  _req: Request,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  const session = await auth();
+
+  if (!session?.user?.email) {
+    return NextResponse.json({ message: "Unauthorized" }, { status: 401 });
+  }
+
+  const { id } = await params;
+
+  if (!ObjectId.isValid(id)) {
+    return NextResponse.json({ message: "Invalid prediction id" }, { status: 400 });
+  }
+
+  const client = await clientPromise;
+  const db = client.db();
+  const result = await db.collection("predictions").deleteOne({
+    _id: new ObjectId(id),
+    userEmail: session.user.email,
+  });
+
+  if (result.deletedCount === 0) {
+    return NextResponse.json({ message: "Prediction not found" }, { status: 404 });
+  }
+
+  return NextResponse.json({ message: "Deleted", predictionId: id });
+}
